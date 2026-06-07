@@ -5,10 +5,11 @@ mod id;
 mod passwd;
 mod password;
 mod shadow;
+mod subid;
 
 use std::{collections::BTreeSet, io::Write, process::ExitCode};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use log::{Level, LevelFilter};
 
 use config::Config;
@@ -16,6 +17,7 @@ use group::Group;
 use passwd::Passwd;
 use password::HashedPassword;
 use shadow::Shadow;
+use subid::{SubId, SubIds};
 
 /// Fallback path to the nologin binary.
 ///
@@ -94,6 +96,7 @@ fn run() -> Result<()> {
     let mut group_db = Group::from_file(&group_path).unwrap_or_default();
     let mut passwd_db = Passwd::from_file(&passwd_path).unwrap_or_default();
     let mut shadow_db = Shadow::from_file(&shadow_path).unwrap_or_default();
+    let mut sub_ids = SubIds::from_dir(&directory);
 
     update_users_and_groups(
         &config,
@@ -105,6 +108,8 @@ fn run() -> Result<()> {
 
     warn_about_weak_password_hashes(&shadow_db);
 
+    update_subids(&config, &mut sub_ids)?;
+
     // Resolve the `shadow` group from the database we just built so the lookup is independent of
     // the host's NSS configuration and works on first boot before /etc/group exists.
     let shadow_gid = group_db.get("shadow").map(group::Entry::gid);
@@ -115,7 +120,105 @@ fn run() -> Result<()> {
     group_db.to_file(group_path)?;
     passwd_db.to_file(passwd_path)?;
     shadow_db.to_file_sorted(&passwd_db, shadow_path, shadow_gid)?;
+    sub_ids.to_dir(&directory)?;
 
+    Ok(())
+}
+
+/// Reconcile `/etc/sub{u,g}id` with the declared config.
+///
+/// Explicit ranges are written verbatim. For users with `auto_sub_id_range` set, an existing
+/// auto-style range is carried over, otherwise a fresh non-overlapping one is allocated.
+///
+/// Entries for owners not in the config are kept so that subordinate id ranges can never be
+/// reassigned to a different owner.
+fn update_subids(config: &Config, sub_ids: &mut SubIds) -> Result<()> {
+    // First pass: lay down all explicit ranges and carry over existing auto ranges, so the
+    // second pass can allocate new auto ranges against the complete picture. Users without
+    // any subid config are skipped so their existing on-disk entries are preserved verbatim.
+    let mut needs_auto: Vec<&str> = Vec::new();
+    for user in config.users.iter().filter(|u| u.has_sub_id_config()) {
+        let mut uranges: Vec<_> = user
+            .sub_uid_ranges
+            .iter()
+            .copied()
+            .map(Into::into)
+            .collect();
+        let mut granges: Vec<_> = user
+            .sub_gid_ranges
+            .iter()
+            .copied()
+            .map(Into::into)
+            .collect();
+
+        // Auto ranges are mirrored to both files (see `SubIds::auto_range`).
+        // Only the explicit ranges above are per-file.
+        if user.auto_sub_id_range {
+            if let Some(existing) = sub_ids.auto_range(&user.name, config.sub_id_auto_count) {
+                uranges.push(existing);
+                granges.push(existing);
+            } else {
+                needs_auto.push(&user.name);
+            }
+        }
+
+        sub_ids.uid.set(&user.name, uranges);
+        sub_ids.gid.set(&user.name, granges);
+    }
+
+    // Second pass: allocate fresh auto ranges in config order.
+    // allocate() tolerates the duplicates from chaining both files.
+    for name in needs_auto {
+        let mut occupied: Vec<_> = sub_ids
+            .uid
+            .entries()
+            .chain(sub_ids.gid.entries())
+            .map(|e| e.range)
+            .collect();
+        occupied.sort_by_key(|r| r.start);
+
+        let range = subid::allocate(config.sub_id_auto_base, config.sub_id_auto_count, &occupied)
+            .with_context(|| {
+            format!("Failed to allocate auto subordinate id range for {name}")
+        })?;
+        log::info!(
+            "Allocated subordinate id range {} (count {}) for user {name}.",
+            range.start,
+            range.count,
+        );
+
+        for db in [&mut sub_ids.uid, &mut sub_ids.gid] {
+            let mut v = db.ranges(name).to_vec();
+            v.push(range);
+            db.set(name, v);
+        }
+    }
+
+    check_subid_overlap("subuid", &sub_ids.uid, config.strict_sub_id_overlap)?;
+    check_subid_overlap("subgid", &sub_ids.gid, config.strict_sub_id_overlap)?;
+
+    Ok(())
+}
+
+/// Report subordinate id ranges that overlap across distinct owners.
+///
+/// The auto allocator never produces overlaps, so any overlap comes from explicit config or
+/// pre-existing on-disk state. By default this only warns, since refusing to write would
+/// leave the file absent or stale. With `strict` it becomes a hard error and the previous
+/// file contents are left untouched.
+fn check_subid_overlap(what: &str, db: &SubId, strict: bool) -> Result<()> {
+    let entries: Vec<_> = db.entries().collect();
+    if let Some((a, b)) = subid::find_overlap(&entries) {
+        let msg = format!(
+            "{what}: range {}:{}:{} overlaps {}:{}:{}. \
+             One user's unprivileged containers may access the other's",
+            a.name, a.range.start, a.range.count, b.name, b.range.start, b.range.count,
+        );
+        if strict {
+            bail!("{msg}");
+        }
+        log::warn!("{msg}.");
+    }
     Ok(())
 }
 
@@ -761,6 +864,96 @@ mod tests {
             normalo:$y$j9T$CZSAJTLCfrBvcCgvOTY4W1$G7uzyX3O6K.DR8KJLL/oL.8EREPSRTIjBn76SpvcH4A:1::::::
         "#]];
         expected_shadow.assert_eq(&shadow_db.to_buffer_sorted(&passwd_db));
+
+        Ok(())
+    }
+
+    #[test]
+    fn update_subids_across_generations() -> Result<()> {
+        let mut sub_ids = SubIds::default();
+
+        // GEN 0: alice (auto) and root with the huge incus-style range.
+        // alice's auto range must be allocated below the root range.
+        let gen0: Config = serde_json::from_value(serde_json::json!({
+            "users": [
+                {
+                    "name": "root", "uid": 0,
+                    "subUidRanges": [ { "start": 1_000_000, "count": 1_000_000_000 } ],
+                    "subGidRanges": [ { "start": 1_000_000, "count": 1_000_000_000 } ],
+                },
+                { "isNormal": true, "name": "alice", "autoSubIdRange": true },
+            ],
+        }))?;
+        update_subids(&gen0, &mut sub_ids)?;
+
+        let expected = expect![[r"
+            alice:100000:65536
+            root:1000000:1000000000
+        "]];
+        expected.assert_eq(&sub_ids.uid.to_buffer());
+        expected.assert_eq(&sub_ids.gid.to_buffer());
+
+        // GEN 1: bob is added with auto, and an explicit user whose range
+        // collides with alice's auto base. bob's auto range slots into the
+        // gap between alice and root. The alice/explicit collision must be
+        // reported but not fail in non-strict mode.
+        let gen1: Config = serde_json::from_value(serde_json::json!({
+            "users": [
+                {
+                    "name": "root", "uid": 0,
+                    "subUidRanges": [ { "start": 1_000_000, "count": 1_000_000_000 } ],
+                    "subGidRanges": [ { "start": 1_000_000, "count": 1_000_000_000 } ],
+                },
+                { "isNormal": true, "name": "alice", "autoSubIdRange": true },
+                { "isNormal": true, "name": "bob", "autoSubIdRange": true },
+                {
+                    "isNormal": true, "name": "explicit",
+                    "subUidRanges": [ { "start": 100_000, "count": 1000 } ],
+                },
+            ],
+        }))?;
+        update_subids(&gen1, &mut sub_ids)?;
+
+        let expected = expect![[r"
+            alice:100000:65536
+            explicit:100000:1000
+            bob:165536:65536
+            root:1000000:1000000000
+        "]];
+        expected.assert_eq(&sub_ids.uid.to_buffer());
+        expect![[r"
+            alice:100000:65536
+            bob:165536:65536
+            root:1000000:1000000000
+        "]]
+        .assert_eq(&sub_ids.gid.to_buffer());
+
+        // GEN 2: alice and explicit are dropped from the config but their
+        // ranges must be kept on disk. Re-applying GEN 1 afterwards must
+        // reproduce the GEN 1 state byte-for-byte.
+        let gen2: Config = serde_json::from_value(serde_json::json!({
+            "users": [
+                { "name": "root", "uid": 0 },
+                { "isNormal": true, "name": "bob", "autoSubIdRange": true },
+            ],
+        }))?;
+        update_subids(&gen2, &mut sub_ids)?;
+        expected.assert_eq(&sub_ids.uid.to_buffer());
+
+        update_subids(&gen1, &mut sub_ids)?;
+        expected.assert_eq(&sub_ids.uid.to_buffer());
+        expect![[r"
+            alice:100000:65536
+            bob:165536:65536
+            root:1000000:1000000000
+        "]]
+        .assert_eq(&sub_ids.gid.to_buffer());
+
+        // Strict mode: the alice/explicit overlap must now fail before
+        // anything is written.
+        let mut gen1_strict = gen1.clone();
+        gen1_strict.strict_sub_id_overlap = true;
+        assert!(update_subids(&gen1_strict, &mut sub_ids).is_err());
 
         Ok(())
     }

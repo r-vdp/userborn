@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- Userborn now manages `/etc/subuid` and `/etc/subgid`. Per-user explicit
+  ranges (`subUidRanges`, `subGidRanges`) are written verbatim, and
+  `autoSubIdRange` allocates a stable, non-overlapping range that is
+  preserved across generations. Like UIDs and GIDs, existing subordinate id
+  entries are never removed so a range cannot be reassigned to a different
+  owner. Cross-owner overlap is logged as a warning, or refused outright
+  when `strictSubIdOverlap` is set in the config.
+
 ## 0.5.0
 
 - Groups that were removed from the config are now emptied (all their users are
